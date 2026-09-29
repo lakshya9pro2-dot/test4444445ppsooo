@@ -1,13 +1,66 @@
 #!/usr/bin/env python3
 import concurrent.futures
-import json
+import logging
 import os
 import re
+import shutil
 import subprocess
+import sys
+import time
 import urllib.parse
-from flask import Flask, request, jsonify, Response, send_file, render_template_string
+
+import requests
+from flask import Flask, request, jsonify, Response, send_file
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ---------------------------------------------------------------------------
+# Logging (stdout -> visible in Render "Logs" tab). Set LOG_LEVEL=DEBUG in
+# Render's Environment tab for more detail.
+# ---------------------------------------------------------------------------
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    stream=sys.stdout,
+    level=LOG_LEVEL,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    force=True,
+)
+logger = logging.getLogger("extractor")
 
 app = Flask(__name__)
+
+
+def log_startup_diagnostics():
+    """Log everything that usually differs between local and Render."""
+    logger.info("=== Startup diagnostics ===")
+    logger.info("Python: %s", sys.version.split()[0])
+    logger.info("CWD: %s", os.getcwd())
+    logger.info("BASE_DIR: %s", BASE_DIR)
+    try:
+        logger.info("Files in BASE_DIR: %s", sorted(os.listdir(BASE_DIR)))
+    except Exception:
+        logger.exception("Could not list BASE_DIR")
+    for name in ("player.html", "hls.min.js"):
+        path = os.path.join(BASE_DIR, name)
+        logger.info("%s exists: %s (%s)", name, os.path.exists(path), path)
+    logger.info("node binary: %s", shutil.which("node") or "NOT FOUND (regex fallback will be used)")
+    logger.info("requests version: %s", requests.__version__)
+    logger.info("PORT env: %s", os.environ.get("PORT"))
+    logger.info("===========================")
+
+
+@app.before_request
+def _start_timer():
+    request._start = time.time()
+
+
+@app.after_request
+def _log_request(response):
+    ms = (time.time() - getattr(request, "_start", time.time())) * 1000
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+    level = logging.WARNING if response.status_code >= 400 else logging.INFO
+    logger.log(level, "%s %s -> %s (%.0f ms) ip=%s", request.method, request.full_path.rstrip("?"), response.status_code, ms, ip)
+    return response
 
 @app.after_request
 def add_cors_headers(response):
@@ -115,7 +168,6 @@ def parse_ids_from_string(s: str) -> tuple[str, str]:
     return st_id, va_id
 
 def extract_vidara(url_or_id: str) -> dict:
-    import requests
     if "://" in url_or_id:
         parsed = urllib.parse.urlparse(url_or_id)
         main_url = f"{parsed.scheme or 'https'}://{parsed.netloc}"
@@ -130,9 +182,15 @@ def extract_vidara(url_or_id: str) -> dict:
         "device": "web"
     }
 
+    logger.info("Vidara: POST %s filecode=%s", api_url, file_code)
     resp = requests.post(api_url, json=payload, headers=DEFAULT_HEADERS, timeout=12)
+    logger.info("Vidara: status=%s bytes=%s", resp.status_code, len(resp.content))
+    if resp.status_code >= 400:
+        logger.error("Vidara: HTTP %s body[:300]=%r", resp.status_code, resp.text[:300])
     resp.raise_for_status()
     data = resp.json()
+    if not data.get("streaming_url"):
+        logger.error("Vidara: no streaming_url in response keys=%s", list(data.keys()))
 
     streaming_url = data.get("streaming_url", "")
     title = data.get("title", "")
@@ -161,8 +219,10 @@ def eval_streamtape_js(expr: str) -> str:
         ).strip()
         if res:
             return res
-    except Exception:
-        pass
+    except FileNotFoundError:
+        logger.warning("node not installed on this server; using regex fallback for streamtape token")
+    except Exception as e:
+        logger.warning("node eval failed (%s); using regex fallback", e)
 
     token_re = re.compile(r"['\"]([^'\"]*)['\"]((?:\.substring\(\s*\d+\s*(?:,\s*\d+\s*)?\))*)")
     parts = []
@@ -176,16 +236,20 @@ def eval_streamtape_js(expr: str) -> str:
     return "".join(parts)
 
 def extract_streamtape(url_or_id: str) -> dict:
-    import requests
     if "://" in url_or_id:
         url = url_or_id
+        clean = clean_id(url_or_id)  # FIX: was undefined when a full URL was passed
     else:
         clean = clean_id(url_or_id)
         url = f"https://streamtape.com/v/{clean}/"
 
+    logger.info("Streamtape: GET %s", url)
     resp = requests.get(url, headers=DEFAULT_HEADERS, timeout=12)
-    resp.raise_for_status()
     html = resp.text
+    logger.info("Streamtape: status=%s bytes=%s final_url=%s", resp.status_code, len(html), resp.url)
+    if resp.status_code >= 400:
+        logger.error("Streamtape: HTTP %s (Render's datacenter IP may be blocked) body[:300]=%r", resp.status_code, html[:300])
+    resp.raise_for_status()
 
     title = ""
     title_match = re.search(r"<title>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
@@ -198,12 +262,19 @@ def extract_streamtape(url_or_id: str) -> dict:
         match = re.search(r"getElementById\(['\"](?:no)?robotlink['\"]\)\.innerHTML\s*=\s*([^;]+);", html)
 
     if not match:
+        logger.error(
+            "Streamtape: token not found. 'botlink' in html=%s, 'captcha' in html=%s, body[:300]=%r",
+            "botlink" in html, "captcha" in html.lower(), html[:300],
+        )
         raise ValueError("Could not find media stream token in HTML")
 
     expr = match.group(1).strip()
+    logger.debug("Streamtape: token expr=%s", expr)
     eval_result = eval_streamtape_js(expr)
     if not eval_result:
+        logger.error("Streamtape: failed to evaluate token expr=%s", expr)
         raise ValueError("Failed to evaluate media script token")
+    logger.info("Streamtape: resolved OK")
 
     if eval_result.startswith("//"):
         stream_url = f"https:{eval_result}&stream=1"
@@ -250,9 +321,10 @@ def extract_any(url: str) -> dict:
 
 @app.route("/hls.min.js", methods=["GET"])
 def serve_hls_js():
-    js_path = os.path.join(os.path.dirname(__file__), "hls.min.js")
+    js_path = os.path.join(BASE_DIR, "hls.min.js")
     if os.path.exists(js_path):
         return send_file(js_path, mimetype="application/javascript")
+    logger.warning("hls.min.js missing at %s (was it committed to git?)", js_path)
     return Response("// HLS not cached locally", mimetype="application/javascript")
 
 # --- HTML PLAYER ROUTES ---
@@ -260,9 +332,13 @@ def serve_hls_js():
 @app.route("/player.html", defaults={"subpath": ""}, methods=["GET"])
 @app.route("/player.html/<path:subpath>", methods=["GET"])
 def serve_player(subpath=""):
-    player_path = os.path.join(os.path.dirname(__file__), "player.html")
+    player_path = os.path.join(BASE_DIR, "player.html")
     if os.path.exists(player_path):
         return send_file(player_path, mimetype="text/html")
+    logger.error(
+        "player.html NOT FOUND at %s. Files present: %s (Linux is case-sensitive; check name + git)",
+        player_path, sorted(os.listdir(BASE_DIR)),
+    )
     return "player.html not found", 404
 
 @app.route("/player", defaults={"subpath": ""}, methods=["GET"])
@@ -299,6 +375,7 @@ def api_resolve(subpath=""):
         st_input = "0A2vDYQz3wIbPQ6"
         va_input = "d932127894f1"
 
+    logger.info("resolve: st_id=%r va_id=%r", st_input, va_input)
     st_res = None
     va_res = None
 
@@ -306,12 +383,14 @@ def api_resolve(subpath=""):
         try:
             return extract_streamtape(sid)
         except Exception as e:
+            logger.exception("fetch_st failed for id=%s", sid)
             return {"status": "error", "error": str(e), "id": sid}
 
     def fetch_va(vid):
         try:
             return extract_vidara(vid)
         except Exception as e:
+            logger.exception("fetch_va failed for id=%s", vid)
             return {"status": "error", "error": str(e), "id": vid}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
@@ -334,6 +413,7 @@ def api_resolve(subpath=""):
     else:
         mode = "none"
 
+    logger.info("resolve: mode=%s", mode)
     thumb = (va_res or {}).get("thumbnail") or (st_res or {}).get("thumbnail")
     subs = (va_res or {}).get("subtitles") or []
 
@@ -368,7 +448,7 @@ def serve_master_playlist():
             else:
                 video_m3u8 = va_url
     except Exception:
-        pass
+        logger.exception("playlist: vidara lookup failed for %r, using fallback video url", va_id)
 
     manifest = f"""#EXTM3U
 #EXT-X-VERSION:6
@@ -388,7 +468,28 @@ def serve_master_playlist():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "port": 4447, "service": "stream-extractor-backend"})
+    return jsonify({"status": "ok", "port": int(os.environ.get("PORT", 4447)), "service": "stream-extractor-backend"})
+
+
+@app.route("/api/diag", methods=["GET"])
+def diag():
+    """Open this on Render to see what's different from local."""
+    out = {
+        "cwd": os.getcwd(),
+        "base_dir": BASE_DIR,
+        "files": sorted(os.listdir(BASE_DIR)),
+        "player_html_exists": os.path.exists(os.path.join(BASE_DIR, "player.html")),
+        "hls_js_exists": os.path.exists(os.path.join(BASE_DIR, "hls.min.js")),
+        "node": shutil.which("node"),
+    }
+    for name, fn, arg in (("streamtape", extract_streamtape, "0A2vDYQz3wIbPQ6"), ("vidara", extract_vidara, "d932127894f1")):
+        try:
+            r = fn(arg)
+            out[name] = {"ok": bool(r.get("url"))}
+        except Exception as e:
+            out[name] = {"ok": False, "error": str(e)}
+    logger.info("diag: %s", out)
+    return jsonify(out)
 
 @app.route("/api/extract", methods=["GET", "POST"])
 def api_extract():
@@ -411,6 +512,7 @@ def api_extract():
             return Response(plain, mimetype="text/plain")
         return jsonify(result)
     except Exception as e:
+        logger.exception("api_extract failed for url=%s", url)
         return jsonify({"status": "error", "message": str(e), "url": url}), 500
 
 @app.route("/api/streamtape", methods=["GET"])
@@ -458,7 +560,10 @@ def text_vidara():
 def index():
     return serve_player()
 
+# Runs under both `python app.py` and gunicorn (`gunicorn app:app`)
+log_startup_diagnostics()
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 4447))
-    print(f"[*] Starting Stream Extractor Backend on http://0.0.0.0:{port}")
+    logger.info("Starting Stream Extractor Backend on http://0.0.0.0:%s", port)
     app.run(host="0.0.0.0", port=port, debug=False)
