@@ -333,6 +333,9 @@ async function handleResolve(request, env, url) {
   let [st, va] = await readIds(request, url);
   if (!st && !va) { st = DEFAULT_ST; va = DEFAULT_VA; }
   log("resolve", { st, va });
+  if (!env.PROXY_SECRET) {
+    log("WARNING: PROXY_SECRET is not set, Vidara/HLS/audio are disabled. Run: npx wrangler secret put PROXY_SECRET");
+  }
 
   const safe = async (fn, id) => {
     try { return await fn(id); }
@@ -353,11 +356,15 @@ async function handleResolve(request, env, url) {
     };
   }
   if (vaRaw && !vaRaw.status) {
-    vaRes = {
-      status: "success", source: "Secondary Server", original_url: `/v/${vaRaw.id}`,
-      url: await hlsProxyUrl(o, env, vaRaw.url), text: vaRaw.title, title: vaRaw.title,
-      thumbnail: vaRaw.thumbnail, subtitles: vaRaw.subtitles, stream_type: "m3u8",
-    };
+    if (!env.PROXY_SECRET) {
+      vaRes = { status: "error", error: "PROXY_SECRET is not set on the Worker (needed for Vidara/HLS)", id: vaRaw.id };
+    } else {
+      vaRes = {
+        status: "success", source: "Secondary Server", original_url: `/v/${vaRaw.id}`,
+        url: await hlsProxyUrl(o, env, vaRaw.url), text: vaRaw.title, title: vaRaw.title,
+        thumbnail: vaRaw.thumbnail, subtitles: vaRaw.subtitles, stream_type: "m3u8",
+      };
+    }
   }
 
   const stOk = stRes?.status === "success" && !!stRes.url;
@@ -367,7 +374,7 @@ async function handleResolve(request, env, url) {
 
   const audio_tracks = [];
   for (const t of AUDIO_TRACKS) {
-    audio_tracks.push({ ...t, url: t.url ? await hlsProxyUrl(o, env, t.url) : null });
+    audio_tracks.push({ ...t, url: t.url && env.PROXY_SECRET ? await hlsProxyUrl(o, env, t.url) : null });
   }
 
   return json({
@@ -422,7 +429,7 @@ export default {
       if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
 
       let resp;
-      if (path === "/health") resp = json({ status: "ok", service: "stream-proxy-worker" });
+      if (path === "/health") resp = json({ status: "ok", service: "stream-proxy-worker", proxy_secret_set: !!env.PROXY_SECRET, origin_set: !!env.ORIGIN });
       else if (path.startsWith("/api/resolve")) resp = await handleResolve(request, env, url);
       else if (path === "/api/link") resp = await handleLink(request, url);
       else if (path.startsWith("/p/st/")) resp = await handleStreamtapeStream(request, cleanId(path.slice(6)));
