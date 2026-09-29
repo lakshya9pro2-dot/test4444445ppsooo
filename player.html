@@ -705,9 +705,9 @@
 
   <div class="player-wrapper video-container" id="playerWrapper">
     <!-- Primary Video Layer -->
-    <video id="videoStreamtape" class="video-layer" crossorigin="anonymous" playsinline webkit-playsinline></video>
+    <video id="videoStreamtape" class="video-layer" playsinline webkit-playsinline></video>
     <!-- Secondary Video Layer (Fallback) -->
-    <video id="videoVidara" class="video-layer" crossorigin="anonymous" playsinline webkit-playsinline></video>
+    <video id="videoVidara" class="video-layer" playsinline webkit-playsinline></video>
     <!-- Dedicated Audio Element (HLS instance playing the selected alternate audio track) -->
     <video id="audioHlsElement" class="video-layer" style="display:none;" playsinline></video>
 
@@ -1010,7 +1010,13 @@
         const vaOk = vaData.status === 'success' && vaData.url;
 
         currentSTUrl = stOk ? stData.url : null;
+        if (currentSTUrl && currentSTUrl.startsWith('/') && window.location.protocol === 'file:') {
+          currentSTUrl = 'http://localhost:4447' + currentSTUrl;
+        }
         currentVAUrl = vaOk ? vaData.url : null;
+        if (currentVAUrl && currentVAUrl.startsWith('/') && window.location.protocol === 'file:') {
+          currentVAUrl = 'http://localhost:4447' + currentVAUrl;
+        }
 
         // Setup thumbnail if available
         const thumbUrl = data.thumbnail || (vaData && vaData.thumbnail) || (stData && stData.thumbnail) || null;

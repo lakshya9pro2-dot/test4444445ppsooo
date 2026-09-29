@@ -233,12 +233,15 @@ def extract_streamtape(url_or_id: str) -> dict:
         pass
 
     final_url = tapecontent_url if tapecontent_url else stream_url
+    proxy_url = f"/api/proxy/stream?url={urllib.parse.quote(final_url, safe='')}"
 
     return {
         "status": "success",
         "source": "Primary Server",
         "original_url": f"/v/{clean}",
-        "url": final_url,
+        "url": proxy_url,
+        "proxy_url": proxy_url,
+        "direct_url": final_url,
         "tapecontent_url": tapecontent_url or final_url,
         "stream_url": stream_url,
         "text": title,
@@ -269,6 +272,72 @@ def extract_any(url: str) -> dict:
             return extract_streamtape(url)
 
     raise ValueError(f"Unsupported host/domain '{domain}'.")
+
+# --- STREAM PROXY ROUTE (Solves StreamTape IP-lock 403 & CORS) ---
+
+@app.route("/api/proxy/stream", methods=["GET", "HEAD", "OPTIONS"])
+def proxy_stream():
+    """Proxies media stream chunks from TapeContent so users on any IP can stream without 403 or CORS errors."""
+    if request.method == "OPTIONS":
+        return Response("", status=204, headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        })
+
+    target_url = request.args.get("url")
+    if not target_url:
+        return jsonify({"status": "error", "message": "Missing 'url' parameter"}), 400
+
+    req_headers = {
+        "User-Agent": DEFAULT_HEADERS["User-Agent"],
+        "Accept": "*/*",
+    }
+    if "Range" in request.headers:
+        req_headers["Range"] = request.headers["Range"]
+
+    try:
+        import requests
+        method = requests.head if request.method == "HEAD" else requests.get
+        upstream = method(
+            target_url,
+            headers=req_headers,
+            stream=True,
+            timeout=15,
+            allow_redirects=True
+        )
+
+        resp_headers = []
+        passthrough = ["content-range", "content-length", "content-type", "accept-ranges"]
+        for k, v in upstream.headers.items():
+            if k.lower() in passthrough:
+                resp_headers.append((k, v))
+
+        resp_headers.append(("Access-Control-Allow-Origin", "*"))
+        resp_headers.append(("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS"))
+        resp_headers.append(("Access-Control-Allow-Headers", "*"))
+        resp_headers.append(("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges"))
+        resp_headers.append(("Accept-Ranges", "bytes"))
+
+        if request.method == "HEAD":
+            return Response("", status=upstream.status_code, headers=resp_headers, mimetype=upstream.headers.get("content-type", "video/mp4"))
+
+        def stream_chunks():
+            try:
+                for chunk in upstream.iter_content(chunk_size=128 * 1024):
+                    if chunk:
+                        yield chunk
+            finally:
+                upstream.close()
+
+        return Response(
+            stream_chunks(),
+            status=upstream.status_code,
+            headers=resp_headers,
+            mimetype=upstream.headers.get("content-type", "video/mp4")
+        )
+    except Exception as e:
+        return Response(f"Proxy error: {str(e)}", status=502, mimetype="text/plain")
 
 # --- STATIC FILE ROUTES ---
 
