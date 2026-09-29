@@ -186,7 +186,9 @@ curl "http://localhost:4447/api/resolve?st=0A2vDYQz3wIbPQ6&va=fea967f75055"
     "status": "success",
     "source": "Primary Server",
     "title": "Nilakanta.2026.UNCUT.1080p...",
-    "url": "https://.../get_video?...",
+    "url": "https://...tapecontent.net/.../video.mp4?stream=1",
+    "tapecontent_url": "https://...tapecontent.net/.../video.mp4?stream=1",
+    "stream_url": "https://streamtape.com/get_video?id=...",
     "stream_type": "mp4"
   },
   "secondary": {
