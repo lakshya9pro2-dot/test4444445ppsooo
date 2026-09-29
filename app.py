@@ -414,6 +414,7 @@ def api_resolve(subpath=""):
         mode = "none"
 
     logger.info("resolve: mode=%s", mode)
+
     thumb = (va_res or {}).get("thumbnail") or (st_res or {}).get("thumbnail")
     subs = (va_res or {}).get("subtitles") or []
 
