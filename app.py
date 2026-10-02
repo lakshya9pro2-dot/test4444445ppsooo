@@ -19,30 +19,50 @@ def add_cors_headers(response):
 STREAMTAPE_DEFAULT_URL = "https://streamtape.com/v/0A2vDYQz3wIbPQ6/"
 VIDARA_DEFAULT_URL = "https://vidara.to/v/d932127894f1"
 
-# Audio Tracks for HLS Master Playlist & Player
-DEFAULT_AUDIO_TRACKS = [
-    {
-        "id": "original",
-        "name": "Original Audio (Fast)",
-        "language": "original",
-        "default": True,
-        "url": None
-    },
-    {
-        "id": "hindi",
-        "name": "Hindi (MS)",
-        "language": "hindi-(ms)",
-        "default": False,
-        "url": "https://m696yefd.s1q2105.com//audio/jCpnus1evj/index.m3u8"
-    },
-    {
-        "id": "telugu",
-        "name": "Telugu (MS)",
-        "language": "telugu-(ms)",
-        "default": False,
-        "url": "https://m696yefd.s1q2105.com//audio/sMFUCb6Pka/index.m3u8"
-    }
-]
+def extract_audio_tracks_from_m3u(m3u_url: str) -> list[dict]:
+    """Fetches master M3U in real-time and parses dynamic #EXT-X-MEDIA:TYPE=AUDIO tracks."""
+    import requests
+    if not m3u_url or not m3u_url.startswith("http"):
+        return []
+    try:
+        resp = requests.get(m3u_url, headers=DEFAULT_HEADERS, timeout=8)
+        if resp.status_code != 200:
+            return []
+        text = resp.text
+        tracks = []
+        seen = set()
+        for line in text.splitlines():
+            line = line.strip()
+            if not line.startswith("#EXT-X-MEDIA:") or "TYPE=AUDIO" not in line:
+                continue
+            m_name = re.search(r'NAME="([^"]+)"', line, re.IGNORECASE)
+            m_lang = re.search(r'LANGUAGE="([^"]+)"', line, re.IGNORECASE)
+            m_uri = re.search(r'URI="([^"]+)"', line, re.IGNORECASE)
+            m_def = re.search(r'DEFAULT=(YES|NO)', line, re.IGNORECASE)
+
+            if not m_uri:
+                continue
+
+            uri = urllib.parse.urljoin(m3u_url, m_uri.group(1).strip())
+            name = m_name.group(1).strip() if m_name else (m_lang.group(1).strip() if m_lang else "Audio Track")
+            lang = m_lang.group(1).strip() if m_lang else ""
+            is_default = bool(m_def and m_def.group(1).upper() == "YES")
+
+            tid = f"{lang}|{name}|{uri}"
+            if tid in seen:
+                continue
+            seen.add(tid)
+
+            tracks.append({
+                "id": re.sub(r"[^a-zA-Z0-9_\-]", "_", (lang or name).lower()),
+                "name": name,
+                "language": lang,
+                "default": is_default,
+                "url": uri
+            })
+        return tracks
+    except Exception:
+        return []
 
 # Domain lists matching CloudStream3 extractors (Vidara.kt & StreamTape.kt)
 STREAMTAPE_DOMAINS = {
@@ -139,6 +159,11 @@ def extract_vidara(url_or_id: str) -> dict:
     thumbnail = data.get("thumbnail")
     subtitles = data.get("subtitles")
 
+    # Real-time extraction of dynamic audio tracks from actual M3U
+    dynamic_audio_tracks = []
+    if streaming_url and ".m3u8" in streaming_url:
+        dynamic_audio_tracks = extract_audio_tracks_from_m3u(streaming_url)
+
     return {
         "status": "success",
         "source": "Secondary Server",
@@ -148,6 +173,7 @@ def extract_vidara(url_or_id: str) -> dict:
         "title": title,
         "thumbnail": thumbnail,
         "subtitles": subtitles,
+        "audio_tracks": dynamic_audio_tracks,
         "stream_type": "m3u8" if streaming_url.endswith(".m3u8") else "direct",
     }
 
@@ -430,6 +456,18 @@ def api_resolve(subpath=""):
     thumb = (va_res or {}).get("thumbnail") or (st_res or {}).get("thumbnail")
     subs = (va_res or {}).get("subtitles") or []
 
+    # Dynamic audio tracks parsed directly from the stream's M3U in real-time
+    dynamic_audio_tracks = (va_res or {}).get("audio_tracks") or []
+    audio_tracks = [
+        {
+            "id": "original",
+            "name": "Original Audio (Fast)",
+            "language": "original",
+            "default": True,
+            "url": None
+        }
+    ] + dynamic_audio_tracks
+
     return jsonify({
         "status": "success" if (st_ok or va_ok) else "error",
         "mode": mode,
@@ -441,41 +479,26 @@ def api_resolve(subpath=""):
         "va": va_res,
         "thumbnail": thumb,
         "subtitles": subs,
-        "audio_tracks": DEFAULT_AUDIO_TRACKS
+        "audio_tracks": audio_tracks
     })
 
-# --- HLS MASTER PLAYLIST WITH MULTI-AUDIO TRACKS ---
+# --- HLS MASTER PLAYLIST (Proxies real-time M3U directly from upstream) ---
 
 @app.route("/playlist.m3u8", methods=["GET"])
 @app.route("/api/playlist.m3u8", methods=["GET"])
 def serve_master_playlist():
     va_id = request.args.get("va") or "d932127894f1"
-    video_m3u8 = "https://s13-25t.s1q2105.com/hls/XllfQzImUDsHoOts9WN4Bo8BhuzGNx8T/index_1998x1080.m3u8"
     try:
         va_res = extract_vidara(va_id)
-        if va_res.get("url"):
-            # If the url is master.m3u8, get sub playlist or direct url
-            va_url = va_res["url"]
-            if va_url.endswith("master.m3u8"):
-                video_m3u8 = va_url.replace("master.m3u8", "index_1998x1080.m3u8")
-            else:
-                video_m3u8 = va_url
+        va_url = va_res.get("url")
+        if va_url and va_url.startswith("http"):
+            import requests
+            resp = requests.get(va_url, headers=DEFAULT_HEADERS, timeout=10)
+            if resp.status_code == 200:
+                return Response(resp.text, mimetype="application/vnd.apple.mpegurl")
     except Exception:
         pass
-
-    manifest = f"""#EXTM3U
-#EXT-X-VERSION:6
-
-# Audio Track 1: Hindi (MS)
-#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Hindi (MS)",DEFAULT=YES,AUTOSELECT=YES,LANGUAGE="hindi-(ms)",URI="https://m696yefd.s1q2105.com//audio/jCpnus1evj/index.m3u8"
-# Audio Track 2: Telugu (MS)
-#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Telugu (MS)",DEFAULT=NO,AUTOSELECT=YES,LANGUAGE="telugu-(ms)",URI="https://m696yefd.s1q2105.com//audio/sMFUCb6Pka/index.m3u8"
-
-# Video Stream
-#EXT-X-STREAM-INF:BANDWIDTH=5000000,AVERAGE-BANDWIDTH=5000000,CODECS="avc1.640028,mp4a.40.2",RESOLUTION=1998x1080,FRAME-RATE=30.000,AUDIO="audio"
-{video_m3u8}
-"""
-    return Response(manifest, mimetype="application/vnd.apple.mpegurl")
+    return Response("#EXTM3U\n#EXT-X-VERSION:6\n", mimetype="application/vnd.apple.mpegurl")
 
 # --- EXISTING ENDPOINTS ---
 

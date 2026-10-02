@@ -705,11 +705,11 @@
 
   <div class="player-wrapper video-container" id="playerWrapper">
     <!-- Primary Video Layer -->
-    <video id="videoStreamtape" class="video-layer" playsinline webkit-playsinline></video>
+    <video id="videoStreamtape" class="video-layer" playsinline webkit-playsinline preload="auto"></video>
     <!-- Secondary Video Layer (Fallback) -->
-    <video id="videoVidara" class="video-layer" playsinline webkit-playsinline></video>
+    <video id="videoVidara" class="video-layer" playsinline webkit-playsinline preload="none"></video>
     <!-- Dedicated Audio Element (HLS instance playing the selected alternate audio track) -->
-    <video id="audioHlsElement" class="video-layer" style="display:none;" playsinline></video>
+    <audio id="audioHlsElement" playsinline preload="auto" style="display:none;"></audio>
 
     <!-- Click / tap surface -->
     <div class="tap-layer" id="tapLayer"></div>
@@ -781,7 +781,10 @@
             <span class="top-btn-label">Audio &amp; Subtitles</span>
           </button>
           <div class="menu menu-top" id="audioSubMenu">
-            <div class="menu-header">Audio</div>
+            <div class="menu-header">
+              <span>Audio</span>
+              <span class="drift" id="audioPreloadStatus" style="font-size:0.75rem; text-transform:none; color:var(--accent-green); display:none;">⚡ Fast Preload</span>
+            </div>
             <div id="audioList"></div>
             <div id="audioSyncRow" hidden>
               <div class="menu-header"><span>Audio sync</span><span class="drift">drift <span id="driftVal">N/A</span></span></div>
@@ -884,6 +887,11 @@
     let masterVideo = videoST;       // Primary controller element for timeline
     let isBuffering = false;
     let loadToken = 0;               // guards async work against a newer loadStreams()
+    let currentLoadedAudioUrl = null;// tracks currently mounted audio HLS stream to avoid rebuilding
+    let isAudioPreloading = false;
+    let isAudioReady = false;
+    let lastAudioSeekTime = 0;
+    let audioWaitTimer = null;
 
     // --- AUDIO TRACK STATE (built at runtime from the real M3U/HLS data) ---
     // Entry: { key, kind: 'native'|'external'|'hls'|'mute', label, lang, url?, hlsIndex? }
@@ -1027,15 +1035,31 @@
         availableSubtitles = Array.isArray(rawSubs) ? rawSubs.filter(s => s && (s.file_path || s.url)) : [];
         setupSubtitleUI(availableSubtitles);
 
+        // Immediate aggressive seeding of dynamic audio tracks from API
+        if (Array.isArray(data.audio_tracks) && data.audio_tracks.length > 0) {
+          const initialTracks = data.audio_tracks
+            .filter(t => t && t.url)
+            .map(t => ({
+              name: t.name || t.id,
+              lang: t.language || t.id,
+              url: t.url,
+              isDefault: !!t.default
+            }));
+          if (initialTracks.length > 0) {
+            manifestAudioTracks = initialTracks;
+          }
+        }
+
         if (stOk && vaOk) {
           activeMode = 'dual';
           masterVideo = videoST;
-          updateBadge('dual', 'Cinequay: Fast Video + Multi-Audio');
+          updateBadge('dual', 'Cinequay: Fast Video + Dynamic Multi-Audio ⚡');
           $('videoTitle').textContent = stData.title || vaData.title || 'Dual Stream Video';
-          $('videoSubtitle').textContent = 'Fast Video synced with Multi-Audio Track';
+          $('videoSubtitle').textContent = 'Fast Video with Aggressive Multi-Audio Stream Preload';
 
           refreshAudioTrackList();
           setupDualMode(currentSTUrl);
+          // Fast parallel parse and discovery of any additional audio tracks in master playlist
           loadManifestAudioTracks(currentVAUrl, token);
         } else if (vaOk) {
           activeMode = 'secondary_only';
@@ -1086,11 +1110,12 @@
       videoVA.style.pointerEvents = 'none';
       videoVA.src = '';
 
-      // 3. Audio setup - default is 'original' (fast audio from video)
+      // 3. Audio setup & AGGRESSIVE PRELOAD
       if (isExternalAudio()) {
         loadAudioTrack(currentAudioTrack);
       } else {
-        stopExternalAudio();
+        // Even if default is 'original', aggressively warm up dynamic audio in background
+        warmupDynamicAudio();
       }
       applyMuteState();
 
@@ -1139,7 +1164,7 @@
       showOverlay(true, 'Click to Play Stream', 'Fallback Mode');
     }
 
-    // --- AUDIO TRACKS: DISCOVERY FROM THE REAL M3U / HLS DATA ---
+    // --- AUDIO TRACKS: AGGRESSIVE DISCOVERY & PRE-BUFFERING ---
     function uniqueLabels(tracks) {
       const base = tracks.map((t, i) => (t.name || t.lang || `Track ${i + 1}`).toString().trim());
       const counts = {};
@@ -1152,10 +1177,137 @@
       });
     }
 
-    // Read #EXT-X-MEDIA:TYPE=AUDIO entries from the Vidara master playlist with hls.js itself
-    // (manifest only: autoStartLoad is off and no media is attached, so nothing is downloaded/played).
-    function loadManifestAudioTracks(masterUrl, token) {
-      if (typeof Hls === 'undefined' || !Hls.isSupported() || !masterUrl) return;
+    function updatePreloadStatusUI(active, text = '') {
+      const badge = $('audioPreloadStatus');
+      if (!badge) return;
+      if (active) {
+        badge.style.display = 'inline';
+        badge.textContent = text ? `⚡ ${text}` : '⚡ Dynamic Audio Active';
+      } else {
+        badge.style.display = 'none';
+      }
+    }
+
+    // Warm up dynamic external audio pipeline in the background so it plays with 0ms delay
+    function warmupDynamicAudio() {
+      const dynamicTrack = audioTrackList.find(t => t.kind === 'external');
+      if (!dynamicTrack || !dynamicTrack.url) return;
+
+      if (hlsAudio && currentLoadedAudioUrl === dynamicTrack.url) return;
+
+      console.log('[Aggressive Audio] Pre-buffering dynamic audio:', dynamicTrack.label, dynamicTrack.url);
+      isAudioPreloading = true;
+      updatePreloadStatusUI(true, 'Pre-buffering...');
+
+      currentLoadedAudioUrl = dynamicTrack.url;
+      const startPos = Math.max(0, (masterVideo.currentTime || 0) + audioOffset);
+
+      if (hlsAudio) {
+        hlsAudio.destroy();
+        hlsAudio = null;
+      }
+
+      attachHlsToElement(dynamicTrack.url, audioHlsEl, (inst) => {
+        hlsAudio = inst;
+        inst.on(Hls.Events.FRAG_LOADED, () => {
+          isAudioReady = true;
+          isAudioPreloading = false;
+          updatePreloadStatusUI(true, `${dynamicTrack.label} (Ready ⚡)`);
+        });
+      }, {
+        startPosition: startPos,
+        isAudio: true,
+        onFatal: () => {
+          console.warn('[Aggressive Audio] Pre-buffer failed on', dynamicTrack.label);
+          isAudioPreloading = false;
+          isAudioReady = false;
+          currentLoadedAudioUrl = null;
+          updatePreloadStatusUI(false);
+        }
+      });
+
+      audioHlsEl.currentTime = startPos;
+      applyMuteState(); // Muted while in original mode
+    }
+
+    function parseAudioTracksFromM3u(text, baseUrl) {
+      const tracks = [];
+      const lines = text.split('\n');
+      const seen = new Set();
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('#EXT-X-MEDIA:') || !trimmed.includes('TYPE=AUDIO')) continue;
+        const nameMatch = trimmed.match(/NAME="([^"]+)"/i);
+        const langMatch = trimmed.match(/LANGUAGE="([^"]+)"/i);
+        const uriMatch = trimmed.match(/URI="([^"]+)"/i);
+        const defMatch = trimmed.match(/DEFAULT=(YES|NO)/i);
+
+        if (!uriMatch) continue;
+        let uri = uriMatch[1];
+        try {
+          uri = new URL(uri, baseUrl).href;
+        } catch (_) {}
+
+        const name = nameMatch ? nameMatch[1] : (langMatch ? langMatch[1] : 'Track');
+        const lang = langMatch ? langMatch[1] : '';
+        const isDefault = defMatch ? defMatch[1].toUpperCase() === 'YES' : false;
+
+        const id = `${lang}|${name}|${uri}`;
+        if (seen.has(id)) continue;
+        seen.add(id);
+
+        tracks.push({ name, lang, url: uri, isDefault });
+      }
+      return tracks;
+    }
+
+    function mergeManifestAudioTracks(newTracks) {
+      if (!newTracks || !newTracks.length) return;
+      const existingUrls = new Set(manifestAudioTracks.map(t => t.url));
+      let added = false;
+      newTracks.forEach(t => {
+        if (!existingUrls.has(t.url)) {
+          manifestAudioTracks.push(t);
+          existingUrls.add(t.url);
+          added = true;
+        }
+      });
+      if (added || manifestAudioTracks.length === 0) {
+        if (manifestAudioTracks.length === 0) manifestAudioTracks = newTracks;
+        refreshAudioTrackList();
+        if (!hlsAudio) {
+          warmupDynamicAudio();
+        }
+      }
+    }
+
+    // Read #EXT-X-MEDIA:TYPE=AUDIO entries from Vidara master playlist with fast parallel fetch & HLS fallback
+    async function loadManifestAudioTracks(masterUrl, token) {
+      if (!masterUrl) return;
+      let discoveredTracks = [];
+
+      // 1. Fast parallel fetch & parse directly (no HLS engine spin-up delay)
+      try {
+        const resp = await fetch(masterUrl, { cache: 'force-cache' });
+        if (resp.ok && token === loadToken && activeMode === 'dual') {
+          const text = await resp.text();
+          const parsed = parseAudioTracksFromM3u(text, masterUrl);
+          if (parsed && parsed.length > 0) {
+            discoveredTracks = parsed;
+          }
+        }
+      } catch (e) {
+        console.log('Fast manifest fetch fallback to HLS parser:', e);
+      }
+
+      if (discoveredTracks.length > 0 && token === loadToken && activeMode === 'dual') {
+        mergeManifestAudioTracks(discoveredTracks);
+        return;
+      }
+
+      // 2. Fallback using HLS.js instance
+      if (typeof Hls === 'undefined' || !Hls.isSupported()) return;
       let done = false;
       let meta = null;
       let timer = null;
@@ -1166,8 +1318,9 @@
         clearTimeout(timer);
         try { meta.destroy(); } catch (e) { /* ignore */ }
         if (token !== loadToken || activeMode !== 'dual') return;
-        manifestAudioTracks = tracks;
-        refreshAudioTrackList();
+        if (tracks && tracks.length > 0) {
+          mergeManifestAudioTracks(tracks);
+        }
       };
 
       try {
@@ -1185,7 +1338,7 @@
           finish(out);
         });
         meta.on(Hls.Events.ERROR, (_evt, data) => { if (data && data.fatal) finish([]); });
-        timer = setTimeout(() => finish([]), 12000);
+        timer = setTimeout(() => finish([]), 10000);
         meta.loadSource(masterUrl);
       } catch (err) {
         console.warn('Audio track discovery failed:', err);
@@ -1349,7 +1502,6 @@
 
       if (track.kind === 'mute') {
         applyMuteState();
-        stopExternalAudio();
         showToast('Audio muted');
         return;
       }
@@ -1358,16 +1510,19 @@
       userMuted = false;
 
       if (track.kind === 'native') {
-        stopExternalAudio();
+        // Keep dynamic audio pre-warmed in background if in dual mode, don't destroy it!
+        applyMuteState();
+        showToast(`Audio: ${track.label}`);
       } else if (track.kind === 'hls') {
         stopExternalAudio();
         if (hlsVA) hlsVA.audioTrack = track.hlsIndex;
+        applyMuteState();
+        showToast(`Audio: ${track.label}`);
       } else if (track.kind === 'external') {
         loadAudioTrack(trackKey);
+        applyMuteState();
+        showToast(`⚡ Audio: ${track.label} (Aggressive Load)`);
       }
-
-      applyMuteState();
-      showToast(`Audio: ${track.label}`);
     }
 
     function loadAudioTrack(trackKey) {
@@ -1378,6 +1533,23 @@
       const isPlaying = !masterVideo.paused;
       const startPos = Math.max(0, currentTime + audioOffset);
 
+      // Fast-path: If already mounted in hlsAudio, reuse the aggressive buffer!
+      if (hlsAudio && currentLoadedAudioUrl === track.url) {
+        if (Math.abs(audioHlsEl.currentTime - startPos) > 0.3) {
+          audioHlsEl.currentTime = startPos;
+        }
+        applyMuteState();
+        if (isPlaying && audioHlsEl.paused) {
+          audioHlsEl.play().catch(e => console.log('Audio resume catch:', e));
+        }
+        updatePreloadStatusUI(true, `${track.label} (Active ⚡)`);
+        return;
+      }
+
+      currentLoadedAudioUrl = track.url;
+      isAudioPreloading = true;
+      updatePreloadStatusUI(true, `${track.label} (Loading...)`);
+
       if (hlsAudio) {
         hlsAudio.destroy();
         hlsAudio = null;
@@ -1385,22 +1557,42 @@
 
       attachHlsToElement(track.url, audioHlsEl, (inst) => {
         hlsAudio = inst;
+        inst.on(Hls.Events.FRAG_LOADED, () => {
+          isAudioReady = true;
+          isAudioPreloading = false;
+          updatePreloadStatusUI(true, `${track.label} (Active ⚡)`);
+        });
       }, {
         startPosition: startPos,
+        isAudio: true,
         onFatal: () => {
           showToast('Audio track failed to load - using original audio');
+          currentLoadedAudioUrl = null;
+          isAudioPreloading = false;
+          isAudioReady = false;
           selectAudioTrack('original');
         }
       });
 
       audioHlsEl.currentTime = startPos;
       if (isPlaying) {
-        audioHlsEl.play().catch(e => console.log('Audio track play rejected:', e));
+        audioHlsEl.play().catch(e => {
+          console.log('Audio track play rejected:', e);
+          audioHlsEl.addEventListener('canplay', () => {
+            if (!masterVideo.paused && isExternalAudio()) {
+              audioHlsEl.play().catch(() => {});
+            }
+          }, { once: true });
+        });
       }
     }
 
     function stopExternalAudio() {
       if (hlsAudio) { hlsAudio.destroy(); hlsAudio = null; }
+      currentLoadedAudioUrl = null;
+      isAudioPreloading = false;
+      isAudioReady = false;
+      updatePreloadStatusUI(false);
       audioHlsEl.pause();
       audioHlsEl.removeAttribute('src');
       try { audioHlsEl.load(); } catch (e) { /* ignore */ }
@@ -1414,6 +1606,7 @@
       const t = getAudioTrack(trackKey);
       const sync = $('audioSyncRow');
       if (sync) sync.hidden = !(t && t.kind === 'external');
+      updatePreloadStatusUI(isExternalAudio() || isAudioReady, isExternalAudio() ? 'Active ⚡' : (isAudioReady ? 'Preloaded ⚡' : ''));
     }
 
     // Cycle audio tracks with keyboard shortcut 'A' (order comes from the detected tracks)
@@ -1655,14 +1848,35 @@
     }
 
     // --- HLS ATTACH HELPER ---
-    // opts: { startPosition, onFatal }
+    // opts: { startPosition, onFatal, isAudio }
     function attachHlsToElement(url, el, callback, opts) {
       opts = opts || {};
       if (typeof Hls !== 'undefined' && Hls.isSupported()) {
+        const isAudio = !!opts.isAudio;
         const cfg = {
           enableWorker: true,
           lowLatencyMode: false,
-          backBufferLength: 90
+          backBufferLength: 90,
+          // Aggressive HLS configuration for Dynamic Audio Tracks
+          ...(isAudio ? {
+            startFragPrefetch: true,        // Aggressively fetch first audio fragment immediately
+            autoStartLoad: true,
+            maxBufferLength: 60,            // Buffer 60s ahead aggressively
+            maxMaxBufferLength: 120,        // Max 120s buffer
+            maxBufferSize: 30 * 1024 * 1024,// 30 MB buffer allocation for audio
+            maxBufferHole: 0.5,             // Jump gaps up to 500ms automatically
+            highBufferWatchdogPeriod: 1,
+            nudgeOffset: 0.1,
+            nudgeMaxRetry: 5,
+            maxFragLookUpTolerance: 0.25,
+            fragLoadingTimeOut: 15000,
+            manifestLoadingTimeOut: 10000,
+            fragLoadingMaxRetry: 6,
+            manifestLoadingMaxRetry: 4,
+            fragLoadingRetryDelay: 300,     // Quick retry
+            manifestLoadingRetryDelay: 300, // Quick retry
+            progressive: true,              // Decode progressive chunks into MSE
+          } : {})
         };
         if (typeof opts.startPosition === 'number') cfg.startPosition = opts.startPosition;
         const hls = new Hls(cfg);
@@ -1693,6 +1907,10 @@
     function destroyHlsInstances() {
       if (hlsVA) { hlsVA.destroy(); hlsVA = null; }
       if (hlsAudio) { hlsAudio.destroy(); hlsAudio = null; }
+      currentLoadedAudioUrl = null;
+      isAudioPreloading = false;
+      isAudioReady = false;
+      updatePreloadStatusUI(false);
     }
 
     // --- SYNCHRONIZATION ENGINE ---
@@ -1701,25 +1919,44 @@
       const activeAudio = isExternalAudio() ? audioHlsEl : null;
       const driftEl = $('driftVal');
 
-      if (activeAudio && activeAudio.src) {
+      if (activeAudio && (activeAudio.src || hlsAudio)) {
         const targetAudioTime = masterVideo.currentTime + audioOffset;
-        const drift = activeAudio.currentTime - targetAudioTime;
+        const drift = activeAudio.currentTime - targetAudioTime; // negative: audio behind, positive: audio ahead
         const absDrift = Math.abs(drift);
 
-        driftEl.textContent = `${absDrift.toFixed(2)}s`;
-        if (absDrift < 0.15) {
-          driftEl.style.color = 'var(--accent-green)';
-        } else if (absDrift < 0.4) {
-          driftEl.style.color = 'var(--accent-amber)';
-        } else {
-          driftEl.style.color = 'var(--accent-red)';
+        if (driftEl) {
+          driftEl.textContent = `${absDrift.toFixed(2)}s`;
+          if (absDrift < 0.12) {
+            driftEl.style.color = 'var(--accent-green)';
+          } else if (absDrift < 0.35) {
+            driftEl.style.color = 'var(--accent-amber)';
+          } else {
+            driftEl.style.color = 'var(--accent-red)';
+          }
         }
 
-        // Auto-correct audio if drift exceeds 250ms
-        if (absDrift > 0.25 && !masterVideo.paused && !activeAudio.paused) {
-          activeAudio.currentTime = Math.max(0, targetAudioTime);
+        const now = Date.now();
+        // AV-Sync Phase-Lock: Adjust playbackRate for small drifts, rate-limited seek for large drifts
+        if (!masterVideo.paused && !activeAudio.paused && !activeAudio.seeking) {
+          if (absDrift <= 0.06) {
+            // In sync! Lock playback rate to master video
+            if (activeAudio.playbackRate !== masterVideo.playbackRate) {
+              activeAudio.playbackRate = masterVideo.playbackRate;
+            }
+          } else if (absDrift <= 0.5) {
+            // Smooth rate micro-nudge (NO seeking, NO buffer flushing!)
+            const rateAdjust = drift < 0 ? 1.05 : 0.95;
+            activeAudio.playbackRate = masterVideo.playbackRate * rateAdjust;
+          } else if (absDrift > 0.5 && now - lastAudioSeekTime > 1500) {
+            // Large drift > 500ms and rate-limited to once per 1.5s:
+            lastAudioSeekTime = now;
+            activeAudio.playbackRate = masterVideo.playbackRate;
+            activeAudio.currentTime = Math.max(0, targetAudioTime);
+          }
+        } else if (masterVideo.paused && !activeAudio.paused) {
+          activeAudio.pause();
         }
-      } else {
+      } else if (driftEl) {
         driftEl.textContent = 'N/A';
         driftEl.style.color = 'var(--text-muted)';
       }
@@ -1766,17 +2003,36 @@
     });
 
     audioHlsEl.addEventListener('waiting', () => {
-      if (isExternalAudio()) {
-        showSpinner(true);
-        if (!masterVideo.paused) masterVideo.pause();
+      if (isExternalAudio() && !masterVideo.paused) {
+        if (!audioWaitTimer) {
+          audioWaitTimer = setTimeout(() => {
+            if (isExternalAudio() && !masterVideo.paused && audioHlsEl.readyState < 3) {
+              showSpinner(true);
+              masterVideo.pause();
+            }
+            audioWaitTimer = null;
+          }, 350); // 350ms grace period prevents micro-stutter
+        }
       }
     });
 
     audioHlsEl.addEventListener('playing', () => {
+      if (audioWaitTimer) {
+        clearTimeout(audioWaitTimer);
+        audioWaitTimer = null;
+      }
       showSpinner(false);
-      if (masterVideo.paused && hasStarted) {
+      if (masterVideo.paused && hasStarted && !masterVideo.ended) {
         masterVideo.play().catch(e => console.log('Video resume catch:', e));
       }
+    });
+
+    audioHlsEl.addEventListener('canplay', () => {
+      if (audioWaitTimer) {
+        clearTimeout(audioWaitTimer);
+        audioWaitTimer = null;
+      }
+      showSpinner(false);
     });
 
     // Error fallbacks
@@ -1846,10 +2102,37 @@
       try {
         hasStarted = true;
         showOverlay(false);
+
+        // If external audio is selected, ensure it's loaded and primed
+        if (isExternalAudio()) {
+          const cur = getAudioTrack(currentAudioTrack);
+          if (cur && cur.url && (!hlsAudio || currentLoadedAudioUrl !== cur.url)) {
+            loadAudioTrack(currentAudioTrack);
+          }
+        }
+
         const promises = [masterVideo.play()];
         if (isExternalAudio()) {
-          audioHlsEl.currentTime = Math.max(0, masterVideo.currentTime + audioOffset);
-          promises.push(audioHlsEl.play());
+          const targetTime = Math.max(0, masterVideo.currentTime + audioOffset);
+          if (Math.abs(audioHlsEl.currentTime - targetTime) > 0.3) {
+            audioHlsEl.currentTime = targetTime;
+          }
+          promises.push(
+            audioHlsEl.play().catch(e => {
+              console.log('Audio track play rejected:', e);
+              audioHlsEl.addEventListener('canplay', () => {
+                if (!masterVideo.paused && isExternalAudio()) {
+                  audioHlsEl.play().catch(() => {});
+                }
+              }, { once: true });
+            })
+          );
+        } else if (hlsAudio) {
+          // If playing original, keep the pre-warmed audio element timestamp aligned in background
+          const targetTime = Math.max(0, masterVideo.currentTime + audioOffset);
+          if (Math.abs(audioHlsEl.currentTime - targetTime) > 0.5) {
+            audioHlsEl.currentTime = targetTime;
+          }
         }
         await Promise.all(promises);
         updatePlayBtnIcon(true);
@@ -1861,7 +2144,7 @@
     function pauseAll() {
       videoST.pause();
       videoVA.pause();
-      audioHlsEl.pause();
+      if (audioHlsEl) audioHlsEl.pause();
       updatePlayBtnIcon(false);
     }
 
@@ -1887,7 +2170,7 @@
 
     function seekAll(time) {
       masterVideo.currentTime = time;
-      if (isExternalAudio()) {
+      if (hlsAudio && (isExternalAudio() || isAudioReady)) {
         audioHlsEl.currentTime = Math.max(0, time + audioOffset);
       }
       renderSubtitlesAtTime(time);
@@ -1942,7 +2225,7 @@
     function adjustOffset(delta) {
       audioOffset = Math.round((audioOffset + delta) * 100) / 100;
       $('offsetVal').textContent = `${audioOffset > 0 ? '+' : ''}${audioOffset.toFixed(2)}s`;
-      if (isExternalAudio()) {
+      if (hlsAudio && (isExternalAudio() || isAudioReady)) {
         audioHlsEl.currentTime = Math.max(0, masterVideo.currentTime + audioOffset);
       }
     }
@@ -1950,7 +2233,7 @@
     function resetOffset() {
       audioOffset = 0.0;
       $('offsetVal').textContent = '0.00s';
-      if (isExternalAudio()) {
+      if (hlsAudio && (isExternalAudio() || isAudioReady)) {
         audioHlsEl.currentTime = Math.max(0, masterVideo.currentTime);
       }
     }
@@ -2176,7 +2459,13 @@
     $('fullscreenBtn').addEventListener('click', toggleFullscreen);
     $('settingsBtn').addEventListener('click', () => toggleMenu(settingMenu));
     $('speedBtn').addEventListener('click', () => toggleMenu(settingMenu));
-    $('audioSubBtn').addEventListener('click', () => toggleMenu(audioSubMenu));
+    $('audioSubBtn').addEventListener('click', () => {
+      if (activeMode === 'dual' && !hlsAudio) warmupDynamicAudio();
+      toggleMenu(audioSubMenu);
+    });
+    $('audioSubBtn').addEventListener('pointerenter', () => {
+      if (activeMode === 'dual' && !hlsAudio) warmupDynamicAudio();
+    });
     $('lockBtn').addEventListener('click', handleLockScreen);
     $('offsetMinus').addEventListener('click', () => adjustOffset(-0.05));
     $('offsetPlus').addEventListener('click', () => adjustOffset(0.05));
